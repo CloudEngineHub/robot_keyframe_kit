@@ -108,6 +108,12 @@ class ViserKeyframeEditor:
         # Maps motor_joint -> [(rod_joint, ratio), ...] for passive rods
         self.passive_rod_joints: Dict[str, List[Tuple[str, float]]] = {}
         
+        # Floating base detection and root pose sliders
+        self.has_floating_base = self._has_floating_base()
+        self.root_slider_widgets: Dict[str, viser.GuiSliderHandle] = {}
+        if self.has_floating_base:
+            print("[Viser] Detected floating base (freejoint) - root pose controls will be available", flush=True)
+        
         self._discover_joint_couplings()  # Must discover couplings first to know which are drive joints
         self._discover_parallel_linkages()  # Discover parallel linkages before joint discovery
         self._discover_passive_rod_joints()  # Discover passive rod joints (e.g., neck_pitch_front/back)
@@ -290,6 +296,53 @@ class ViserKeyframeEditor:
             self.worker.request_on_ground()
             # Wait for grounding to complete and update the default keyframe
             self._update_default_keyframe_after_ground()
+
+    # -- Floating Base Detection and Helpers --
+
+    def _has_floating_base(self) -> bool:
+        """Check if robot has a floating base (freejoint on root body).
+        
+        A floating base means the robot's root body has a freejoint, giving it
+        6 DoF (3 translation + 3 rotation) stored in qpos[0:7].
+        
+        Returns:
+            True if the model has a freejoint on the root body, False otherwise.
+        """
+        root_body_id = 1  # Body 0 is "world", body 1 is the robot's root
+        for jnt_id in range(self.model.njnt):
+            if self.model.jnt_bodyid[jnt_id] == root_body_id:
+                if self.model.jnt_type[jnt_id] == mujoco.mjtJoint.mjJNT_FREE:
+                    return True
+        return False
+
+    def _euler_to_quat(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
+        """Convert Euler angles (radians) to quaternion (w, x, y, z) for MuJoCo.
+        
+        Args:
+            roll: Rotation around X axis in radians
+            pitch: Rotation around Y axis in radians  
+            yaw: Rotation around Z axis in radians
+            
+        Returns:
+            Quaternion as [w, x, y, z] (MuJoCo convention)
+        """
+        rot = R.from_euler('xyz', [roll, pitch, yaw], degrees=False)
+        quat_xyzw = rot.as_quat()  # scipy returns [x, y, z, w]
+        return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+
+    def _quat_to_euler(self, quat_wxyz: np.ndarray) -> Tuple[float, float, float]:
+        """Convert quaternion (w, x, y, z) to Euler angles (radians).
+        
+        Args:
+            quat_wxyz: Quaternion as [w, x, y, z] (MuJoCo convention)
+            
+        Returns:
+            Tuple of (roll, pitch, yaw) in radians
+        """
+        quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+        rot = R.from_quat(quat_xyzw)
+        euler = rot.as_euler('xyz', degrees=False)
+        return (float(euler[0]), float(euler[1]), float(euler[2]))
 
     def _discover_joints_and_actuators(self) -> None:
         """Auto-discover joints and actuators from the MuJoCo model.
@@ -1032,9 +1085,11 @@ class ViserKeyframeEditor:
                 self._build_keyframe_sequence_panels()
             with left_col:
                 self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
+                self._build_root_position_sliders()  # Root position below joint sliders
                 self._build_ee_panel()
             with right_col:
                 self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
+                self._build_root_orientation_sliders()  # Root orientation below joint sliders
                 self._build_settings_panel()
             return
 
@@ -1043,6 +1098,8 @@ class ViserKeyframeEditor:
         self._build_keyframe_sequence_panels()
         self._build_joint_slider_column(left_joints, "Joint Sliders (L)")
         self._build_joint_slider_column(right_joints, "Joint Sliders (R)")
+        self._build_root_position_sliders()
+        self._build_root_orientation_sliders()
         self._build_ee_panel()
         self._build_settings_panel()
 
@@ -1300,6 +1357,125 @@ class ViserKeyframeEditor:
         right_column.extend(unpaired[midpoint:])
 
         return left_column, right_column
+
+    def _build_root_position_sliders(self) -> None:
+        """Create sliders for root body position (floating base only)."""
+        if not self.has_floating_base:
+            return  # Skip for fixed-base robots
+        
+        # Get current root position from qpos
+        current_pos = self.data.qpos[0:3].copy()
+        
+        with self.server.gui.add_folder("Root Position"):
+            # Position sliders (limits -3 to 3, users can type values outside range)
+            x_slider = self.server.gui.add_slider(
+                "X (m)", min=-3.0, max=3.0, step=0.01, initial_value=float(current_pos[0])
+            )
+            y_slider = self.server.gui.add_slider(
+                "Y (m)", min=-3.0, max=3.0, step=0.01, initial_value=float(current_pos[1])
+            )
+            z_slider = self.server.gui.add_slider(
+                "Z (m)", min=-3.0, max=3.0, step=0.01, initial_value=float(current_pos[2])
+            )
+            
+            # Store references
+            self.root_slider_widgets["x"] = x_slider
+            self.root_slider_widgets["y"] = y_slider
+            self.root_slider_widgets["z"] = z_slider
+            
+            # Callback for position updates
+            def update_root_pose(_event: GuiEvent) -> None:
+                if any(id(s) in self._updating_handles for s in self.root_slider_widgets.values()):
+                    return
+                self._apply_root_pose_from_sliders()
+            
+            # Register callbacks
+            x_slider.on_update(update_root_pose)
+            y_slider.on_update(update_root_pose)
+            z_slider.on_update(update_root_pose)
+
+    def _build_root_orientation_sliders(self) -> None:
+        """Create sliders for root body orientation (floating base only)."""
+        if not self.has_floating_base:
+            return  # Skip for fixed-base robots
+        
+        # Get current root orientation from qpos
+        current_quat = self.data.qpos[3:7].copy()
+        current_euler = self._quat_to_euler(current_quat)
+        
+        with self.server.gui.add_folder("Root Orientation"):
+            # Orientation sliders in radians (-π to π ≈ -3.14 to 3.14)
+            roll_slider = self.server.gui.add_slider(
+                "Roll (rad)", min=-3.14159, max=3.14159, step=0.01, initial_value=float(current_euler[0])
+            )
+            pitch_slider = self.server.gui.add_slider(
+                "Pitch (rad)", min=-3.14159, max=3.14159, step=0.01, initial_value=float(current_euler[1])
+            )
+            yaw_slider = self.server.gui.add_slider(
+                "Yaw (rad)", min=-3.14159, max=3.14159, step=0.01, initial_value=float(current_euler[2])
+            )
+            
+            # Store references
+            self.root_slider_widgets["roll"] = roll_slider
+            self.root_slider_widgets["pitch"] = pitch_slider
+            self.root_slider_widgets["yaw"] = yaw_slider
+            
+            # Callback for orientation updates
+            def update_root_pose(_event: GuiEvent) -> None:
+                if any(id(s) in self._updating_handles for s in self.root_slider_widgets.values()):
+                    return
+                self._apply_root_pose_from_sliders()
+            
+            # Register callbacks
+            roll_slider.on_update(update_root_pose)
+            pitch_slider.on_update(update_root_pose)
+            yaw_slider.on_update(update_root_pose)
+
+    def _apply_root_pose_from_sliders(self) -> None:
+        """Apply root pose from slider values to qpos and update visualization."""
+        if not self.has_floating_base or not self.root_slider_widgets:
+            return
+        
+        # Get position from sliders
+        x = float(self.root_slider_widgets["x"].value)
+        y = float(self.root_slider_widgets["y"].value)
+        z = float(self.root_slider_widgets["z"].value)
+        
+        # Get orientation from sliders and convert to quaternion
+        roll = float(self.root_slider_widgets["roll"].value)
+        pitch = float(self.root_slider_widgets["pitch"].value)
+        yaw = float(self.root_slider_widgets["yaw"].value)
+        quat = self._euler_to_quat(roll, pitch, yaw)
+        
+        # Update qpos
+        self.data.qpos[0] = x
+        self.data.qpos[1] = y
+        self.data.qpos[2] = z
+        self.data.qpos[3:7] = quat
+        
+        # Forward kinematics to update derived quantities
+        mujoco.mj_forward(self.model, self.data)
+        
+        # Also update worker's data
+        self.worker.update_qpos(self.data.qpos.copy())
+
+    def _sync_root_sliders_from_qpos(self) -> None:
+        """Sync root pose sliders from current qpos values."""
+        if not self.has_floating_base or not self.root_slider_widgets:
+            return
+        
+        # Get current root pose from qpos
+        pos = self.data.qpos[0:3]
+        quat = self.data.qpos[3:7]
+        euler = self._quat_to_euler(quat)
+        
+        # Update sliders without triggering callbacks
+        self._set_handle_value(self.root_slider_widgets["x"], float(pos[0]))
+        self._set_handle_value(self.root_slider_widgets["y"], float(pos[1]))
+        self._set_handle_value(self.root_slider_widgets["z"], float(pos[2]))
+        self._set_handle_value(self.root_slider_widgets["roll"], float(euler[0]))
+        self._set_handle_value(self.root_slider_widgets["pitch"], float(euler[1]))
+        self._set_handle_value(self.root_slider_widgets["yaw"], float(euler[2]))
 
     def _build_joint_slider_column(self, joints: List[str], title: str) -> None:
         """Create a folder populated with sliders for the provided joints."""
@@ -2126,11 +2302,16 @@ class ViserKeyframeEditor:
         self.selected_keyframe = idx
         if kf.qpos is not None:
             self.worker.update_qpos(kf.qpos)
+            # Sync local data.qpos for root slider sync
+            self.data.qpos[:] = kf.qpos
+            mujoco.mj_forward(self.model, self.data)
         if kf.joint_pos is not None:
             for jname, val in zip(self.joint_names, kf.joint_pos):
                 slider = self.slider_widgets.get(jname)
                 if slider is not None:
                     self._set_handle_value(slider, float(val))
+        # Sync root pose sliders from qpos (for floating base robots)
+        self._sync_root_sliders_from_qpos()
         if self.keyframe_index_input is not None:
             self._set_handle_value(self.keyframe_index_input, str(idx))
         if self.keyframe_name_input is not None:
@@ -2434,10 +2615,14 @@ class ViserKeyframeEditor:
         self.keyframes[idx].motor_pos = motor_pos.copy()
         self.keyframes[idx].joint_pos = joint_pos.copy()
         self.keyframes[idx].qpos = qpos.copy()
+        # Sync local data.qpos for root slider sync
+        self.data.qpos[:] = qpos
         for jname, val in zip(self.joint_names, joint_pos):
             slider = self.slider_widgets.get(jname)
             if slider is not None:
                 self._set_handle_value(slider, float(val))
+        # Sync root pose sliders from qpos (for floating base robots)
+        self._sync_root_sliders_from_qpos()
 
     def _on_traj(
         self,
